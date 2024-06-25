@@ -1,0 +1,5 @@
+# Generic Stuff
+__pycache__
+.env
+DS_Store
+_local_data
