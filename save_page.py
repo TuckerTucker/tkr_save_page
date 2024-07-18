@@ -1,7 +1,8 @@
 import asyncio
 from playwright.async_api import async_playwright
 import os
-from urllib.parse import urlparse, urljoin
+import base64
+from urllib.parse import urlparse, urljoin, unquote
 import aiofiles
 from tkr_utils.app_paths import AppPaths  # Import AppPaths
 from tkr_utils.helper_openai import OpenAIHelper  # Import OpenAIHelper
@@ -34,7 +35,7 @@ async def save_page_with_assets(url: str, page_save_path):
 
     Args:
         url (str): URL of the webpage to save.
-        base_save_path (str): Base path where the webpage directory will be created.
+        page_save_path (str): Path where the webpage and assets will be saved.
     """
     logger.info(f"Saving page: {url}")
 
@@ -45,17 +46,14 @@ async def save_page_with_assets(url: str, page_save_path):
     error_log_path = os.path.join(page_save_path, 'errors.md')
     
     async with async_playwright() as p:
-        # Launch the browser
         browser = await p.chromium.launch()
         context = await browser.new_context()
         page = await context.new_page()
 
         try:
-            # Navigate to the webpage
             await page.goto(url, wait_until='networkidle')
             logger.info(f"Page loaded: {url}")
 
-            # Save the HTML content
             html_content = await page.content()
 
             # Extract and save all assets
@@ -70,16 +68,34 @@ async def save_page_with_assets(url: str, page_save_path):
 
             for asset_url in urls:
                 try:
-                    asset_url = urljoin(url, asset_url)  # Handle relative URLs
-                    response = await page.goto(asset_url)
-                    buffer = await response.body()
-                    parsed_url = urlparse(asset_url)
-                    file_name = os.path.basename(parsed_url.path)
+                    if asset_url.startswith('data:'):
+                        # Handle data URLs
+                        mime_type, data = asset_url.split(',', 1)
+                        file_extension = mime_type.split(';')[0].split('/')[1]
+                        file_name = f"inline_asset_{hash(data)}.{file_extension}"
+                        file_path = os.path.join(assets_dir, file_name)
+                        
+                        if 'base64' in mime_type:
+                            data = base64.b64decode(data)
+                        else:
+                            data = unquote(data).encode('utf-8')
+                        
+                        async with aiofiles.open(file_path, 'wb') as f:
+                            await f.write(data)
+                    else:
+                        # Handle regular URLs
+                        asset_url = urljoin(url, asset_url)  # Handle relative URLs
+                        response = await page.goto(asset_url)
+                        if response:
+                            buffer = await response.body()
+                            parsed_url = urlparse(asset_url)
+                            file_name = os.path.basename(parsed_url.path) or f"asset_{hash(asset_url)}"
+                            file_path = os.path.join(assets_dir, file_name)
 
-                    file_path = os.path.join(assets_dir, file_name)
-
-                    async with aiofiles.open(file_path, 'wb') as f:
-                        await f.write(buffer)
+                            async with aiofiles.open(file_path, 'wb') as f:
+                                await f.write(buffer)
+                        else:
+                            raise Exception(f"Failed to fetch asset: {asset_url}")
 
                     # Update HTML content to reference local asset files
                     html_content = html_content.replace(asset_url, f'assets/{file_name}')
@@ -101,7 +117,6 @@ async def save_page_with_assets(url: str, page_save_path):
                 await f.write(error_message)
             logger.error(error_message)
         finally:
-            # Close the browser
             await browser.close()
 
         return html_content
@@ -119,15 +134,60 @@ async def send_text_to_openai(text: str, content_type: str = None) -> str:
         str: The response from OpenAI.
     """
     try:
+        system_message = "You are a website copy translator. Provide only the translation. Do not ask for clarity or offer suggestions. If a word doesn't appear to have a translation leave it as is."
+        
+        if content_type:
+            system_message += f" You are currently translating {content_type} content."
+
         messages = [
-            {"role": "system", "content": "You are a website copy translator. Provide only the translation. Do not ask for clarity or offer suggestions. If a word doesn't appear to have a translation leave it as is."},
+            {"role": "system", "content": system_message},
             {"role": "user", "content": f"Translate the following text to Spanish: {text}"}
         ]
-        response = await openai_helper.send_message_async(messages, content_type=content_type)
+        response = await openai_helper.send_message_async(messages)
         return response.choices[0].message.content
     except Exception as e:
         logger.error(f"Error sending text to OpenAI: {e}")
         return str(e)
+
+async def translate_html_content(html_content: str) -> str:
+    """
+    Translate the text content of the HTML to Spanish, including meta tags and img alt attributes.
+
+    Args:
+        html_content (str): The HTML content to translate.
+
+    Returns:
+        str: The translated HTML content.
+    """
+    try:
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # Translate meta tags
+        for meta in soup.find_all('meta', attrs={'name': ['description', 'keywords']}):
+            if 'content' in meta.attrs:
+                original_content = meta['content']
+                translated_content = await send_text_to_openai(original_content, content_type="meta tag")
+                meta['content'] = translated_content
+
+        # Translate img alt attributes
+        for img in soup.find_all('img', alt=True):
+            original_alt = img['alt']
+            if original_alt.strip():
+                translated_alt = await send_text_to_openai(original_alt, content_type="image alt text")
+                img['alt'] = translated_alt
+
+        # Translate visible text content
+        for element in soup.find_all(text=True):
+            if element.parent.name not in ['script', 'style', 'head', 'meta', '[document]']:
+                if element.string and element.string.strip():
+                    content_type = f"{element.parent.name} element"
+                    translated_text = await send_text_to_openai(element.string, content_type=content_type)
+                    element.string.replace_with(translated_text)
+
+        return str(soup)
+    except Exception as e:
+        logger.error(f"Error translating HTML content: {e}")
+        return html_content
 
 async def translate_html_content(html_content: str) -> str:
     """
@@ -184,8 +244,9 @@ def save_dir_info(url):
 # Add the downloads directory using AppPaths
 AppPaths.add("_downloaded_pages")
 
+
 # Example usage
-url = 'https://futuretools.io'
+url = 'https://www.example.com'
 page_save_path = save_dir_info(url)
 
 html_content = asyncio.run(save_page_with_assets(url, page_save_path))
